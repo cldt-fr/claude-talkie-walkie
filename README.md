@@ -164,6 +164,16 @@ The intercom auto-detects ngrok URLs and switches to HTTPS.
 - **Code review relay**: One Claude reviews code and sends findings to the author's Claude session
 - **CI/CD notifications**: Point your CI webhook at the intercom to push build results into a Claude session
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=MuhammadTalhaMT%2Fclaude-intercom&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=MuhammadTalhaMT/claude-intercom&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=MuhammadTalhaMT/claude-intercom&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=MuhammadTalhaMT/claude-intercom&type=date&legend=top-left" />
+ </picture>
+</a>
+
 ## License
 
 MIT
