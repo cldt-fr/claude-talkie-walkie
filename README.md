@@ -4,8 +4,6 @@ Two-way communication bridge between Claude Code sessions using the [Channels AP
 
 Let two Claude Code instances on different machines talk to each other in real-time — no cloning, no setup, just `npx`.
 
-<img width="2020" height="1084" alt="image" src="https://github.com/user-attachments/assets/679e8896-c4dd-4b7b-8066-f0f27b0e8ece" />
-
 ## Why?
 
 Two developers running Claude Code on separate machines currently have to relay questions through Slack or copy-paste. Claude Talkie-Walkie creates a direct hotline between the two AI sessions — one Claude can ask the other about endpoints, schemas, or implementation details and get answers from the actual codebase.
