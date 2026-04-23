@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 /**
  * Claude Intercom - Two-way bridge between Claude Code sessions
  *
@@ -16,6 +16,7 @@
  * @requires @modelcontextprotocol/sdk
  * @see https://code.claude.com/docs/en/channels-reference
  */
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
@@ -148,53 +149,71 @@ await mcp.connect(new StdioServerTransport())
 // Receives messages from the remote machine and pushes them into the
 // local Claude Code session as channel notifications.
 
-Bun.serve({
-  port: PORT,
-  hostname: '0.0.0.0',
-  async fetch(req) {
-    const url = new URL(req.url)
+/** Read the full request body as a string */
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    req.on('data', (c: Buffer) => chunks.push(c))
+    req.on('end', () => resolve(Buffer.concat(chunks).toString()))
+    req.on('error', reject)
+  })
+}
 
-    // Health check — useful for verifying the tunnel/connection
-    if (req.method === 'GET' && url.pathname === '/health') {
-      return new Response(
-        JSON.stringify({ status: 'ok', role: MY_ROLE, version: '1.0.0' }),
-        { headers: { 'Content-Type': 'application/json' } },
-      )
+/** Send a JSON response */
+function jsonResponse(res: ServerResponse, status: number, body: unknown) {
+  res.writeHead(status, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify(body))
+}
+
+const httpServer = createServer(async (req, res) => {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host}`)
+
+  // Health check — useful for verifying the tunnel/connection
+  if (req.method === 'GET' && url.pathname === '/health') {
+    jsonResponse(res, 200, { status: 'ok', role: MY_ROLE, version: '1.0.0' })
+    return
+  }
+
+  // Message endpoint — receives messages from the other instance
+  if (req.method === 'POST' && url.pathname === '/message') {
+    // Authenticate: reject messages without the correct shared secret
+    const token = req.headers['x-intercom-secret']
+    if (token !== SECRET) {
+      res.writeHead(401)
+      res.end('Unauthorized')
+      return
     }
 
-    // Message endpoint — receives messages from the other instance
-    if (req.method === 'POST' && url.pathname === '/message') {
-      // Authenticate: reject messages without the correct shared secret
-      const token = req.headers.get('X-Intercom-Secret')
-      if (token !== SECRET) {
-        return new Response('Unauthorized', { status: 401 })
-      }
+    const body = await readBody(req)
+    const data = JSON.parse(body) as {
+      content: string
+      role: string
+      timestamp: string
+    }
 
-      const data = (await req.json()) as {
-        content: string
-        role: string
-        timestamp: string
-      }
-
-      // Push the message into Claude's conversation as a channel event.
-      // It appears as: <channel source="intercom" role="..." timestamp="...">content</channel>
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: {
-          content: data.content,
-          meta: {
-            role: data.role,
-            timestamp: data.timestamp,
-          },
+    // Push the message into Claude's conversation as a channel event.
+    // It appears as: <channel source="intercom" role="..." timestamp="...">content</channel>
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: data.content,
+        meta: {
+          role: data.role,
+          timestamp: data.timestamp,
         },
-      })
+      },
+    })
 
-      return new Response('ok')
-    }
+    res.writeHead(200)
+    res.end('ok')
+    return
+  }
 
-    return new Response('Not Found', { status: 404 })
-  },
+  res.writeHead(404)
+  res.end('Not Found')
 })
+
+httpServer.listen(PORT, '0.0.0.0')
 
 console.error(`[intercom] ${MY_ROLE} listening on port ${PORT}`)
 console.error(`[intercom] Remote: ${REMOTE_HOST}`)
