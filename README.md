@@ -57,7 +57,7 @@ Add this to your project's `.mcp.json` on **both machines**:
 On **both machines**:
 
 ```bash
-claude --dangerously-load-development-channels server:talkie-walkie
+claude
 ```
 
 ### 3. Talk

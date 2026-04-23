@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "intercom": {
+    "communication": {
       "command": "bun",
       "args": ["./intercom.ts"],
       "env": {

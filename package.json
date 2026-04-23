@@ -1,17 +1,17 @@
 {
   "name": "claude-talkie-walkie",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Two-way communication bridge between Claude Code sessions using the Channels API",
   "type": "module",
   "main": "dist/intercom.js",
   "bin": {
-    "claude-talkie-walkie": "dist/intercom.js"
+    "claude-talkie-walkie": "dist/talkie-walkie.js"
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsup intercom.ts --format esm --target node20 --clean",
+    "build": "tsup talkie-walkie.ts --format esm --target node20 --clean",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
