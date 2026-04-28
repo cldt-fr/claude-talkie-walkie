@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "outDir": "dist"
   },
-  "include": ["intercom.ts"]
+  "include": ["talkie-walkie.ts"]
 }

@@ -1,6 +1,6 @@
 {
   "name": "claude-talkie-walkie",
-  "version": "1.0.2",
+  "version": "2.0.0",
   "description": "Two-way communication bridge between Claude Code sessions using the Channels API",
   "type": "module",
   "main": "dist/intercom.js",
