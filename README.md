@@ -105,9 +105,9 @@ Claude will use `send_message({ to: "tester", message: "..." })`. The tester Cla
 | `broadcast_message` | `{ message, exclude? }` | Send the same message to every peer (optionally skipping some). |
 | `list_peers` | — | List the peers reachable from this machine. |
 
-## Live pixel-art dashboard
+## Live open-space dashboard
 
-Each instance also exposes a Server-Sent Events stream on `GET /events` (auth: same `X-Intercom-Secret` header). The package ships with a viewer subcommand that subscribes to one or more nodes and renders a small animated TUI:
+Each instance exposes a Server-Sent Events stream on `GET /events` (auth: same `X-Intercom-Secret` header). The package ships with a viewer subcommand that subscribes to every node you give it and renders them as a single shared open-space office in your terminal:
 
 ```bash
 INTERCOM_SECRET=your-shared-secret \
@@ -125,21 +125,37 @@ INTERCOM_SECRET=your-shared-secret \
   npx claude-talkie-walkie viewer
 ```
 
-Each panel shows a pixel-art avatar that animates with traffic (talking when sending, listening when receiving, blinking when idle, X-eyes on disconnect), live counters, a 30-second activity sparkline, and the last two message previews.
+Every peer sits at a desk in the same room. When one Claude sends a message, a speech bubble pops above the speaker, an arrow travels along the floor toward the recipient, and the recipient's avatar turns to listen. A chat feed under the room shows the running conversation across all instances (deduped — you see each logical message once even when both endpoints are watched).
 
 ```
-╭──────────────────────────────────────────────────────╮
-│ ● backend  10.0.0.6:8788                             │
-│   ▄████▄    status  receiving                        │
-│  ██▄██▄██   sent    12                               │
-│  ██▀██▀██   recv    8                                │
-│   ▀████▀    30s     5 msg                            │
-│  activity (last 30s)                                 │
-│   ▁▂▁▃▅▇▆▃▁▁▁                                        │
-│  ← from frontend: what endpoints exist for /users?   │
-│  → to frontend:   GET /api/users returns paginated…  │
-╰──────────────────────────────────────────────────────╯
+╔══════◉═════════════◉═════════════◉═════════════◉════════╗
+║                     ╭──────────────╮                    ║
+║                     │ check the l… │                    ║
+║                     ╰───────┬──────╯                    ║
+║                             ╵                           ║
+║       ▄████▄             ▄████▄            ▄████▄█      ║
+║      ██▄██▄██           ██▄██▄██          ██▄██▄██      ║
+║      ██▀██▀██           ███  ███          ██▀██▀██      ║
+║       ▀████▀             ▀████▀            ▀████▀       ║
+║     ▔▔▔▔▔▔▔▔▔▔         ▔▔▔▔▔▔▔▔▔▔        ▔▔▔▔▔▔▔▔▔▔     ║
+║      ╵      ╵           ╵      ╵          ╵      ╵      ║
+║      ● backend         ● frontend         ● tester      ║
+║        idle              talking          listening     ║
+║ · ╌ · ╌ · ╌ · ╌ · ╌ · ╌ · ╌ · ╌ · ╌ ·⋅·▶· ╌ · ╌ · ╌ · ╌·║
+╚═════════════════════════════════════════════════════════╝
+
+─── chat ───────────────────────────────────────────────────
+14:32:15  frontend → backend: what API endpoints exist for /users?
+14:32:16  backend  → frontend: GET /api/users returns paginated list
+14:32:17  frontend → tester:   check the login flow on staging
 ```
+
+Avatar moods:
+- `idle` (gray) — no recent activity, occasional blink
+- `talking` (green) — just sent a message; mouth animates
+- `listening` (cyan) — just received a message; ear pokes out
+- `connecting` (yellow) — handshake in progress, auto-retries every 3s
+- `offline` (red, X-eyes) — auth failed or peer unreachable
 
 The viewer uses an alt-screen so it doesn't clobber your terminal scrollback — Ctrl-C exits cleanly.
 

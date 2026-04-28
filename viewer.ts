@@ -1,24 +1,32 @@
 /**
- * Claude Talkie-Walkie Viewer — live pixel-art console dashboard.
+ * Claude Talkie-Walkie Viewer — open-space console dashboard.
  *
  * Connects to one or more talkie-walkie nodes via SSE (`GET /events`) and
- * renders an animated TUI: per-node panel with an 8×8 half-block avatar
- * that reacts to activity, an activity sparkline, and the latest messages.
+ * renders a single shared "room": each peer sits at a desk with a pixel-art
+ * avatar that animates with traffic, speech bubbles pop up above the
+ * speakers, and messages travel as little arrows on the floor between
+ * sender and recipient. A chat feed at the bottom shows the running
+ * conversation.
  *
  * Usage:
  *   claude-talkie-walkie viewer name=host[,name=host…]   (CLI args)
  *   PEERS=name=host,… INTERCOM_SECRET=… claude-talkie-walkie viewer
- *
- * Auth: uses INTERCOM_SECRET from env, just like the rest of the system.
  */
 import * as http from 'node:http'
 import * as https from 'node:https'
+
+// ── Types ──────────────────────────────────────────────────────────────
 
 interface ActivityEvent {
   type: 'send' | 'recv'
   peer: string
   preview: string
   timestamp: string
+}
+
+interface Bubble {
+  text: string
+  at: number
 }
 
 interface NodeState {
@@ -30,19 +38,37 @@ interface NodeState {
   events: ActivityEvent[]
   sentTotal: number
   recvTotal: number
-  /** Per-second buckets for the last SPARK_SECONDS, indexed by epoch second. */
-  buckets: Map<number, number>
-  /** Epoch ms of the most recent event for animation. */
-  lastEventAt: number
-  lastEventType?: 'send' | 'recv'
+  /** Most recent send / recv timestamps in ms (used for avatar animation). */
+  lastSendAt: number
+  lastRecvAt: number
+  bubble: Bubble | null
 }
 
-const NODE_EVENT_BUFFER = 200
-const SPARK_SECONDS = 30
-const FRAME_INTERVAL_MS = 100
-const RECONNECT_DELAY_MS = 3000
+interface InFlight {
+  fromIdx: number
+  toIdx: number
+  startedAt: number
+}
 
-// ── ANSI helpers ───────────────────────────────────────────────────────
+interface ChatEntry {
+  from: string
+  to: string
+  tsMs: number
+  preview: string
+}
+
+// ── Tunables ───────────────────────────────────────────────────────────
+
+const FRAME_INTERVAL_MS = 100
+const FLIGHT_DURATION_MS = 1800
+const BUBBLE_DURATION_MS = 3500
+const ACTIVE_WINDOW_MS = 2500
+const NODE_EVENT_BUFFER = 200
+const RECONNECT_DELAY_MS = 3000
+const CHAT_LOG_MAX = 200
+const CHAT_DISPLAY_MAX = 6
+
+// ── ANSI ───────────────────────────────────────────────────────────────
 
 const ESC = '\x1b['
 const RESET = `${ESC}0m`
@@ -66,19 +92,19 @@ const FG = {
   white: `${ESC}97m`,
 } as const
 
-// ── Pixel-art sprites (8×8, top-down rows) ─────────────────────────────
-// 1 = lit, 0 = transparent. Rendered with half-blocks: each pair of rows
-// becomes one terminal row using ▀ / ▄ / █ depending on which pixels are lit.
+const ROLE_PALETTE = [FG.cyan, FG.magenta, FG.yellow, FG.green, FG.blue, FG.red] as const
+
+// ── Sprites (8×8, top-down rows; 1 = lit) ──────────────────────────────
 
 type Sprite = ReadonlyArray<ReadonlyArray<0 | 1>>
 
 const SPRITE_IDLE: Sprite = [
   [0, 0, 1, 1, 1, 1, 0, 0],
   [0, 1, 1, 1, 1, 1, 1, 0],
-  [1, 1, 0, 1, 1, 0, 1, 1], // eyes
+  [1, 1, 0, 1, 1, 0, 1, 1],
   [1, 1, 1, 1, 1, 1, 1, 1],
   [1, 1, 1, 1, 1, 1, 1, 1],
-  [1, 1, 0, 1, 1, 0, 1, 1], // small smile
+  [1, 1, 0, 1, 1, 0, 1, 1],
   [0, 1, 1, 1, 1, 1, 1, 0],
   [0, 0, 1, 1, 1, 1, 0, 0],
 ]
@@ -86,7 +112,7 @@ const SPRITE_IDLE: Sprite = [
 const SPRITE_BLINK: Sprite = [
   [0, 0, 1, 1, 1, 1, 0, 0],
   [0, 1, 1, 1, 1, 1, 1, 0],
-  [1, 1, 1, 1, 1, 1, 1, 1], // eyes shut
+  [1, 1, 1, 1, 1, 1, 1, 1],
   [1, 1, 1, 1, 1, 1, 1, 1],
   [1, 1, 1, 1, 1, 1, 1, 1],
   [1, 1, 0, 1, 1, 0, 1, 1],
@@ -99,7 +125,7 @@ const SPRITE_TALK_A: Sprite = [
   [0, 1, 1, 1, 1, 1, 1, 0],
   [1, 1, 0, 1, 1, 0, 1, 1],
   [1, 1, 1, 1, 1, 1, 1, 1],
-  [1, 1, 0, 0, 0, 0, 1, 1], // mouth open
+  [1, 1, 0, 0, 0, 0, 1, 1],
   [1, 1, 0, 0, 0, 0, 1, 1],
   [0, 1, 1, 1, 1, 1, 1, 0],
   [0, 0, 1, 1, 1, 1, 0, 0],
@@ -110,14 +136,14 @@ const SPRITE_TALK_B: Sprite = [
   [0, 1, 1, 1, 1, 1, 1, 0],
   [1, 1, 0, 1, 1, 0, 1, 1],
   [1, 1, 1, 1, 1, 1, 1, 1],
-  [1, 1, 1, 0, 0, 1, 1, 1], // mouth small
+  [1, 1, 1, 0, 0, 1, 1, 1],
   [1, 1, 1, 0, 0, 1, 1, 1],
   [0, 1, 1, 1, 1, 1, 1, 0],
   [0, 0, 1, 1, 1, 1, 0, 0],
 ]
 
 const SPRITE_LISTEN: Sprite = [
-  [0, 0, 1, 1, 1, 1, 0, 1], // ear pokes out top-right
+  [0, 0, 1, 1, 1, 1, 0, 1],
   [0, 1, 1, 1, 1, 1, 1, 1],
   [1, 1, 0, 1, 1, 0, 1, 1],
   [1, 1, 1, 1, 1, 1, 1, 1],
@@ -130,10 +156,10 @@ const SPRITE_LISTEN: Sprite = [
 const SPRITE_ERROR: Sprite = [
   [0, 0, 1, 1, 1, 1, 0, 0],
   [0, 1, 1, 1, 1, 1, 1, 0],
-  [1, 1, 1, 0, 0, 1, 1, 1], // X eye left
+  [1, 1, 1, 0, 0, 1, 1, 1],
   [1, 1, 0, 1, 1, 0, 1, 1],
   [1, 1, 0, 1, 1, 0, 1, 1],
-  [1, 1, 1, 0, 0, 1, 1, 1], // X eye right (mirror)
+  [1, 1, 1, 0, 0, 1, 1, 1],
   [0, 1, 1, 1, 1, 1, 1, 0],
   [0, 0, 1, 1, 1, 1, 0, 0],
 ]
@@ -149,46 +175,129 @@ const SPRITE_CONNECTING: Sprite = [
   [0, 0, 1, 1, 1, 1, 0, 0],
 ]
 
-/** Render an 8-row sprite with one foreground color into 4 terminal rows. */
-function renderSprite(sprite: Sprite, fg: string): string[] {
-  const lines: string[] = []
+/** Render an 8-row sprite as a 4×8 grid of cells (each cell already colored). */
+function renderSpriteCells(sprite: Sprite, color: string): string[][] {
+  const rows: string[][] = []
   for (let y = 0; y < sprite.length; y += 2) {
     const top = sprite[y]
     const bot = sprite[y + 1] ?? Array(top.length).fill(0)
-    let line = fg
+    const row: string[] = []
     for (let x = 0; x < top.length; x++) {
       const t = top[x]
       const b = bot[x]
-      if (t && b) line += '█'
-      else if (t) line += '▀'
-      else if (b) line += '▄'
-      else line += ' '
+      let ch = ' '
+      if (t && b) ch = '█'
+      else if (t) ch = '▀'
+      else if (b) ch = '▄'
+      row.push(ch === ' ' ? ' ' : color + ch + RESET)
     }
-    line += RESET
-    lines.push(line)
+    rows.push(row)
   }
-  return lines
+  return rows
 }
 
-// ── Sparkline ──────────────────────────────────────────────────────────
+// ── Canvas (2D grid of cells, each cell = one visible char ± ANSI) ─────
 
-const SPARK_GLYPHS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'] as const
+class Canvas {
+  readonly width: number
+  readonly height: number
+  readonly cells: string[][]
 
-function sparkline(values: number[], width: number): string {
-  if (values.length === 0) return ' '.repeat(width)
-  const slice = values.slice(-width)
-  const padded = Array(Math.max(0, width - slice.length)).fill(0).concat(slice)
-  const max = Math.max(1, ...padded)
-  return padded
-    .map(v => {
-      if (v === 0) return ' '
-      const idx = Math.min(SPARK_GLYPHS.length - 1, Math.floor((v / max) * (SPARK_GLYPHS.length - 1)))
-      return SPARK_GLYPHS[idx]
-    })
-    .join('')
+  constructor(width: number, height: number) {
+    this.width = width
+    this.height = height
+    this.cells = Array.from({ length: height }, () => Array(width).fill(' '))
+  }
+
+  set(x: number, y: number, ch: string): void {
+    if (x < 0 || x >= this.width || y < 0 || y >= this.height) return
+    this.cells[y][x] = ch
+  }
+
+  setColored(x: number, y: number, ch: string, color: string): void {
+    this.set(x, y, color + ch + RESET)
+  }
+
+  stampPlain(x: number, y: number, str: string, color?: string): void {
+    for (let i = 0; i < str.length; i++) {
+      const ch = str[i]
+      if (color && ch !== ' ') this.setColored(x + i, y, ch, color)
+      else this.set(x + i, y, ch)
+    }
+  }
+
+  stampCells(x: number, y: number, cells: string[][]): void {
+    for (let dy = 0; dy < cells.length; dy++) {
+      for (let dx = 0; dx < cells[dy].length; dx++) {
+        const c = cells[dy][dx]
+        if (c !== ' ') this.set(x + dx, y + dy, c)
+      }
+    }
+  }
+
+  toLines(): string[] {
+    return this.cells.map(row => row.join(''))
+  }
 }
 
-// ── Connection management ─────────────────────────────────────────────
+// ── Connection ─────────────────────────────────────────────────────────
+
+const states: NodeState[] = []
+const chatLog: ChatEntry[] = []
+const chatSeen = new Set<string>()
+const inFlight: InFlight[] = []
+let frame = 0
+
+function findStateIdx(name: string): number {
+  return states.findIndex(s => s.name === name)
+}
+
+function colorForRole(name: string): string {
+  let h = 0
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0
+  return ROLE_PALETTE[h % ROLE_PALETTE.length]
+}
+
+function ingestEvent(observer: NodeState, ev: ActivityEvent): void {
+  observer.events.push(ev)
+  if (observer.events.length > NODE_EVENT_BUFFER) observer.events.shift()
+  if (ev.type === 'send') observer.sentTotal++
+  else observer.recvTotal++
+
+  const tsParsed = Date.parse(ev.timestamp)
+  const tsMs = Number.isFinite(tsParsed) ? tsParsed : Date.now()
+
+  // Resolve logical (from, to) regardless of which side observed it.
+  const from = ev.type === 'send' ? observer.name : ev.peer
+  const to = ev.type === 'send' ? ev.peer : observer.name
+
+  // Dedupe (same logical message often observed twice — once on each end).
+  const sec = Math.floor(tsMs / 1000)
+  const key = `${from}>${to}@${sec}|${ev.preview}`
+  if (chatSeen.has(key)) return
+  chatSeen.add(key)
+
+  // Update animation timestamps on both endpoints we know about.
+  const fromIdx = findStateIdx(from)
+  const toIdx = findStateIdx(to)
+  if (fromIdx >= 0) {
+    const s = states[fromIdx]
+    if (tsMs > s.lastSendAt) s.lastSendAt = tsMs
+    s.bubble = { text: ev.preview, at: Date.now() }
+  }
+  if (toIdx >= 0) {
+    const s = states[toIdx]
+    if (tsMs > s.lastRecvAt) s.lastRecvAt = tsMs
+  }
+
+  // In-flight animation only if we can place both endpoints.
+  if (fromIdx >= 0 && toIdx >= 0 && fromIdx !== toIdx && Date.now() - tsMs < 5000) {
+    inFlight.push({ fromIdx, toIdx, startedAt: Date.now() })
+  }
+
+  chatLog.push({ from, to, tsMs, preview: ev.preview })
+  if (chatLog.length > CHAT_LOG_MAX) chatLog.shift()
+}
 
 function connectNode(state: NodeState, secret: string): void {
   state.status = 'connecting'
@@ -224,12 +333,11 @@ function connectNode(state: NodeState, secret: string): void {
           buffer = buffer.slice(sep + 2)
           for (const line of frame.split('\n')) {
             if (!line.startsWith('data: ')) continue
-            const json = line.slice(6)
             try {
-              const ev = JSON.parse(json) as ActivityEvent
+              const ev = JSON.parse(line.slice(6)) as ActivityEvent
               if (ev && (ev.type === 'send' || ev.type === 'recv')) ingestEvent(state, ev)
             } catch {
-              // Ignore non-event frames (hello, comments, etc.)
+              // Non-event frames (hello, pings) are fine to skip.
             }
           }
         }
@@ -258,163 +366,233 @@ function scheduleReconnect(state: NodeState, secret: string): void {
   setTimeout(() => connectNode(state, secret), RECONNECT_DELAY_MS).unref?.()
 }
 
-function ingestEvent(state: NodeState, ev: ActivityEvent): void {
-  state.events.push(ev)
-  if (state.events.length > NODE_EVENT_BUFFER) state.events.shift()
+// ── Avatar selection ──────────────────────────────────────────────────
 
-  if (ev.type === 'send') state.sentTotal++
-  else state.recvTotal++
-
-  const ts = Date.parse(ev.timestamp)
-  state.lastEventAt = Number.isFinite(ts) ? ts : Date.now()
-  state.lastEventType = ev.type
-
-  const sec = Math.floor(state.lastEventAt / 1000)
-  state.buckets.set(sec, (state.buckets.get(sec) ?? 0) + 1)
-  // Drop buckets older than SPARK_SECONDS to keep memory bounded.
-  const cutoff = sec - SPARK_SECONDS
-  for (const k of state.buckets.keys()) if (k < cutoff) state.buckets.delete(k)
-}
-
-function bucketsToSeries(state: NodeState, now: number): number[] {
-  const nowSec = Math.floor(now / 1000)
-  const out: number[] = []
-  for (let i = SPARK_SECONDS - 1; i >= 0; i--) {
-    out.push(state.buckets.get(nowSec - i) ?? 0)
-  }
-  return out
-}
-
-// ── Avatar selection ───────────────────────────────────────────────────
-
-function pickAvatar(state: NodeState, frame: number, now: number): { sprite: Sprite; color: string; label: string } {
+function pickAvatar(state: NodeState, frame: number, now: number): { sprite: Sprite; color: string; mood: string } {
   if (state.status === 'connecting') {
-    const sprite = frame % 6 < 3 ? SPRITE_CONNECTING : SPRITE_BLINK
-    return { sprite, color: FG.yellow, label: 'connecting' }
+    return { sprite: frame % 6 < 3 ? SPRITE_CONNECTING : SPRITE_BLINK, color: FG.yellow, mood: 'connecting' }
   }
   if (state.status === 'error') {
-    return { sprite: SPRITE_ERROR, color: FG.red, label: state.lastError ?? 'error' }
+    return { sprite: SPRITE_ERROR, color: FG.red, mood: 'offline' }
   }
 
-  const since = now - state.lastEventAt
-  if (state.lastEventAt && since < 1500) {
-    if (state.lastEventType === 'send') {
-      const sprite = frame % 4 < 2 ? SPRITE_TALK_A : SPRITE_TALK_B
-      return { sprite, color: FG.green, label: 'sending' }
-    }
-    return { sprite: SPRITE_LISTEN, color: FG.cyan, label: 'receiving' }
+  const sinceSend = state.lastSendAt ? now - state.lastSendAt : Infinity
+  const sinceRecv = state.lastRecvAt ? now - state.lastRecvAt : Infinity
+
+  if (sinceSend < ACTIVE_WINDOW_MS && sinceSend <= sinceRecv) {
+    return { sprite: frame % 4 < 2 ? SPRITE_TALK_A : SPRITE_TALK_B, color: FG.green, mood: 'talking' }
+  }
+  if (sinceRecv < ACTIVE_WINDOW_MS) {
+    return { sprite: SPRITE_LISTEN, color: FG.cyan, mood: 'listening' }
+  }
+  return { sprite: frame % 30 === 0 ? SPRITE_BLINK : SPRITE_IDLE, color: FG.gray, mood: 'idle' }
+}
+
+// ── Drawing helpers ───────────────────────────────────────────────────
+
+function truncate(s: string, max: number): string {
+  if (max <= 0) return ''
+  if (s.length <= max) return s
+  return s.slice(0, Math.max(0, max - 1)) + '…'
+}
+
+function drawBubble(canvas: Canvas, cx: number, topY: number, text: string, maxWidth: number): void {
+  // Layout: │ <content> │ — interior is content.length cells wide, no extra padding.
+  const innerMax = Math.max(4, maxWidth - 4) // -2 borders, -2 visual breathing room
+  const content = truncate(text, innerMax)
+  const inner = content.length + 2 // 1 space of breathing room on each side
+  const w = inner + 2
+
+  let left = cx - Math.floor(w / 2)
+  if (left < 1) left = 1
+  if (left + w > canvas.width - 1) left = canvas.width - 1 - w
+
+  const c = FG.white
+  canvas.setColored(left, topY, '╭', c)
+  for (let i = 1; i < w - 1; i++) canvas.setColored(left + i, topY, '─', c)
+  canvas.setColored(left + w - 1, topY, '╮', c)
+
+  canvas.setColored(left, topY + 1, '│', c)
+  for (let i = 1; i < w - 1; i++) canvas.set(left + i, topY + 1, ' ')
+  canvas.stampPlain(left + 2, topY + 1, content, c)
+  canvas.setColored(left + w - 1, topY + 1, '│', c)
+
+  canvas.setColored(left, topY + 2, '╰', c)
+  for (let i = 1; i < w - 1; i++) {
+    if (left + i === cx) canvas.setColored(left + i, topY + 2, '┬', c)
+    else canvas.setColored(left + i, topY + 2, '─', c)
+  }
+  canvas.setColored(left + w - 1, topY + 2, '╯', c)
+  canvas.setColored(cx, topY + 3, '╵', c)
+}
+
+function drawStation(
+  canvas: Canvas,
+  cx: number,
+  state: NodeState,
+  frame: number,
+  now: number,
+  showBubble: boolean,
+  bubbleMaxWidth: number,
+): void {
+  if (showBubble && state.bubble && now - state.bubble.at < BUBBLE_DURATION_MS) {
+    drawBubble(canvas, cx, 1, state.bubble.text, bubbleMaxWidth)
   }
 
-  // Idle: blink every ~2.5s (3 frames at 10fps).
-  const sprite = frame % 25 === 0 ? SPRITE_BLINK : SPRITE_IDLE
-  return { sprite, color: FG.gray, label: 'idle' }
+  const avatar = pickAvatar(state, frame, now)
+  const cells = renderSpriteCells(avatar.sprite, avatar.color)
+  // Avatar is 4 rows × 8 cols, centered horizontally on cx, top at row 5.
+  canvas.stampCells(cx - 4, 5, cells)
+
+  // Desk: a 10-wide top edge under the avatar.
+  const deskY = 9
+  const deskColor = FG.yellow
+  for (let dx = -5; dx <= 4; dx++) canvas.setColored(cx + dx, deskY, '▔', deskColor)
+  // Chair / under-desk: just a thin underline so the floor pattern shows through.
+  canvas.setColored(cx - 4, deskY + 1, '╵', DIM)
+  canvas.setColored(cx + 3, deskY + 1, '╵', DIM)
+
+  // Name + status dot, centered on cx, on the row just below the desk legs.
+  const dotColor =
+    state.status === 'connected' ? FG.green :
+    state.status === 'connecting' ? FG.yellow :
+    FG.red
+  const roleColor = colorForRole(state.name)
+  const label = `● ${state.name}`
+  const startX = cx - Math.floor(label.length / 2)
+  canvas.setColored(startX, 11, '●', dotColor)
+  canvas.stampPlain(startX + 2, 11, state.name, roleColor)
+
+  // Mood line under the name.
+  const mood = avatar.mood
+  const moodColor = avatar.mood === 'talking' ? FG.green : avatar.mood === 'listening' ? FG.cyan : avatar.mood === 'offline' ? FG.red : DIM
+  const moodStartX = cx - Math.floor(mood.length / 2)
+  canvas.stampPlain(moodStartX, 12, mood, moodColor)
 }
 
-// ── Layout ─────────────────────────────────────────────────────────────
+// ── Render loop ───────────────────────────────────────────────────────
 
-const PANEL_WIDTH = 56
-const PANEL_HEIGHT = 9 // border-included content height (rows between top/bottom border = PANEL_HEIGHT - 2)
-
-function padRight(s: string, width: number): string {
-  // Strips ANSI for length calculation but keeps escape codes.
-  const visible = stripAnsi(s)
-  if (visible.length >= width) return s
-  return s + ' '.repeat(width - visible.length)
-}
-
-function truncate(s: string, width: number): string {
-  if (s.length <= width) return s
-  return s.slice(0, Math.max(0, width - 1)) + '…'
-}
-
-function stripAnsi(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
-}
-
-function buildPanel(state: NodeState, frame: number, now: number): string[] {
-  const inner = PANEL_WIDTH - 2
-  const { sprite, color, label } = pickAvatar(state, frame, now)
-  const avatar = renderSprite(sprite, color) // 4 lines, 8 visual cols
-
-  const statusDot =
-    state.status === 'connected' ? `${FG.green}●${RESET}` :
-    state.status === 'connecting' ? `${FG.yellow}●${RESET}` :
-    `${FG.red}●${RESET}`
-
-  const title = ` ${statusDot} ${BOLD}${state.name}${RESET} ${DIM}${state.host}${RESET} `
-  const titlePadded = padRight(title, inner)
-
-  const series = bucketsToSeries(state, now)
-  const total = series.reduce((a, b) => a + b, 0)
-  const spark = sparkline(series, 30)
-
-  const recent = state.events.slice(-2)
-  const lastLines = recent.length === 0
-    ? [`${DIM}— no traffic yet —${RESET}`, '']
-    : recent.map(e => {
-        const arrow = e.type === 'send' ? `${FG.green}→${RESET}` : `${FG.cyan}←${RESET}`
-        const who = e.type === 'send' ? `to ${e.peer}` : `from ${e.peer}`
-        return `${arrow} ${DIM}${who}:${RESET} ${truncate(e.preview, inner - who.length - 6)}`
-      })
-  while (lastLines.length < 2) lastLines.push('')
-
-  const stats = [
-    `${DIM}status${RESET}  ${label}`,
-    `${DIM}sent${RESET}    ${state.sentTotal}`,
-    `${DIM}recv${RESET}    ${state.recvTotal}`,
-    `${DIM}30s${RESET}     ${total} msg`,
-  ]
-
-  // Compose 4 avatar rows side-by-side with 4 stat rows.
-  const body: string[] = []
-  for (let i = 0; i < 4; i++) {
-    const left = avatar[i] // exactly 8 visible chars
-    const right = stats[i]
-    body.push(`  ${left}   ${right}`)
-  }
-
-  // Sparkline + activity label
-  const sparkLine = `  ${DIM}activity (last ${SPARK_SECONDS}s)${RESET}`
-  const sparkVis = `  ${FG.magenta}${spark}${RESET}`
-
-  const lines: string[] = []
-  lines.push(`╭${'─'.repeat(inner)}╮`)
-  lines.push(`│${titlePadded}│`)
-  for (const row of body) lines.push(`│${padRight(row, inner)}│`)
-  lines.push(`│${padRight(sparkLine, inner)}│`)
-  lines.push(`│${padRight(sparkVis, inner)}│`)
-  for (const row of lastLines) lines.push(`│${padRight('  ' + row, inner)}│`)
-  lines.push(`╰${'─'.repeat(inner)}╯`)
-  return lines
-}
-
-// ── Main render loop ──────────────────────────────────────────────────
-
-let frame = 0
-const states: NodeState[] = []
-
-function render(): void {
+function renderOpenspace(): void {
   frame++
   const now = Date.now()
+
+  // Drop expired in-flight messages.
+  while (inFlight.length && now - inFlight[0].startedAt > FLIGHT_DURATION_MS) {
+    inFlight.shift()
+  }
+
+  const cols = process.stdout.columns || 100
+  const N = states.length
+
+  // Room sizing: try to give every station ~16 cols, but stay within terminal.
+  const desiredWidth = Math.max(60, N * 16 + 10)
+  const roomWidth = Math.max(40, Math.min(cols - 2, desiredWidth))
+  const roomHeight = 15
+
+  const canvas = new Canvas(roomWidth, roomHeight)
+  const wallColor = FG.cyan
+
+  // Walls
+  for (let x = 0; x < roomWidth; x++) {
+    canvas.setColored(x, 0, '═', wallColor)
+    canvas.setColored(x, roomHeight - 1, '═', wallColor)
+  }
+  for (let y = 0; y < roomHeight; y++) {
+    canvas.setColored(0, y, '║', wallColor)
+    canvas.setColored(roomWidth - 1, y, '║', wallColor)
+  }
+  canvas.setColored(0, 0, '╔', wallColor)
+  canvas.setColored(roomWidth - 1, 0, '╗', wallColor)
+  canvas.setColored(0, roomHeight - 1, '╚', wallColor)
+  canvas.setColored(roomWidth - 1, roomHeight - 1, '╝', wallColor)
+
+  // Subtle ceiling lights stamped onto the top wall.
+  for (let x = 7; x < roomWidth - 7; x += 14) canvas.setColored(x, 0, '◉', FG.yellow)
+
+  // Floor pattern (just inside the bottom wall) — also where in-flight arrows fly.
+  const floorY = roomHeight - 2
+  for (let x = 1; x < roomWidth - 1; x++) {
+    const ch = (x % 4 === 2) ? '·' : (x % 4 === 0 ? '╌' : ' ')
+    if (ch !== ' ') canvas.setColored(x, floorY, ch, FG.gray)
+  }
+
+  // Station centers, evenly distributed within the interior.
+  const interiorLeft = 2
+  const interiorRight = roomWidth - 3
+  const interiorWidth = interiorRight - interiorLeft + 1
+  const stationXs: number[] = []
+  for (let i = 0; i < N; i++) {
+    const cx = interiorLeft + Math.floor((interiorWidth * (i * 2 + 1)) / (N * 2))
+    stationXs.push(cx)
+  }
+
+  // Draw stations. Decide bubble visibility per station — only show one
+  // bubble per column slot at a time so they don't pile up.
+  const slotWidth = N > 0 ? Math.floor(interiorWidth / N) : interiorWidth
+  for (let i = 0; i < N; i++) {
+    const cx = stationXs[i]
+    const bubbleMax = Math.max(10, slotWidth - 2)
+    drawStation(canvas, cx, states[i], frame, now, true, bubbleMax)
+  }
+
+  // In-flight arrows on the floor, between sender and receiver columns.
+  for (const flight of inFlight) {
+    const t = Math.min(1, (now - flight.startedAt) / FLIGHT_DURATION_MS)
+    const x0 = stationXs[flight.fromIdx]
+    const x1 = stationXs[flight.toIdx]
+    if (x0 === undefined || x1 === undefined) continue
+    const x = Math.round(x0 + (x1 - x0) * t)
+    const arrow = x1 >= x0 ? '▶' : '◀'
+    canvas.setColored(x, floorY, arrow, FG.yellow)
+    // Trailing dots, fading behind the arrow.
+    const trail = x1 >= x0 ? -1 : 1
+    for (let k = 1; k <= 2; k++) {
+      const tx = x + trail * k
+      if (tx > 0 && tx < roomWidth - 1 && (tx - x0) * (x1 - x0) >= 0) {
+        const cur = canvas.cells[floorY][tx]
+        // Only overdraw if the floor pattern (or empty) is below.
+        if (!cur.includes('▶') && !cur.includes('◀')) {
+          canvas.setColored(tx, floorY, k === 1 ? '·' : '⋅', FG.yellow)
+        }
+      }
+    }
+  }
+
+  // Compose output
   const out: string[] = []
-
   out.push(CURSOR_HOME)
-  const titleBar = `${BOLD}Claude Talkie-Walkie${RESET} ${DIM}· live dashboard · ${new Date(now).toLocaleTimeString()} · Ctrl-C to exit${RESET}`
-  out.push(titleBar)
+  const titleLine = `${BOLD}Claude Talkie-Walkie${RESET}  ${DIM}· open space · ${new Date(now).toLocaleTimeString()} · ${describeStatus()} · Ctrl-C to exit${RESET}`
+  out.push(titleLine)
   out.push('')
+  for (const row of canvas.toLines()) out.push(row)
+  out.push('')
+  out.push(`${DIM}─── chat ${'─'.repeat(Math.max(0, roomWidth - 9))}${RESET}`)
 
-  if (states.length === 0) {
-    out.push(`${FG.yellow}No nodes configured.${RESET}`)
-  } else {
-    for (const state of states) {
-      out.push(...buildPanel(state, frame, now))
+  const recent = chatLog.slice(-CHAT_DISPLAY_MAX)
+  const lineWidth = Math.max(40, cols - 2)
+  for (let i = 0; i < CHAT_DISPLAY_MAX; i++) {
+    if (i < recent.length) {
+      const e = recent[i]
+      const time = new Date(e.tsMs).toLocaleTimeString()
+      const fromColor = colorForRole(e.from)
+      const toColor = colorForRole(e.to)
+      const prefix = `${DIM}${time}${RESET}  ${fromColor}${e.from}${RESET} ${DIM}→${RESET} ${toColor}${e.to}${RESET}: `
+      const prefixVisibleLen = time.length + 2 + e.from.length + 1 + 1 + 1 + e.to.length + 2
+      const room = Math.max(8, lineWidth - prefixVisibleLen)
+      out.push(prefix + truncate(e.preview, room))
+    } else {
       out.push('')
     }
   }
 
   out.push(CLEAR_BELOW)
   process.stdout.write(out.join('\n'))
+}
+
+function describeStatus(): string {
+  if (states.length === 0) return 'no peers'
+  const connected = states.filter(s => s.status === 'connected').length
+  return `${connected}/${states.length} online`
 }
 
 // ── Entry point ───────────────────────────────────────────────────────
@@ -424,7 +602,6 @@ interface PeerSpec { name: string; host: string }
 function parsePeerSpecs(args: string[]): PeerSpec[] {
   const collected: string[] = []
   for (const a of args) {
-    // Accept both space-separated args and comma-separated bundles.
     for (const piece of a.split(',')) {
       const trimmed = piece.trim()
       if (trimmed) collected.push(trimmed)
@@ -475,14 +652,14 @@ export async function runViewer(argv: string[]): Promise<void> {
       events: [],
       sentTotal: 0,
       recvTotal: 0,
-      buckets: new Map(),
-      lastEventAt: 0,
+      lastSendAt: 0,
+      lastRecvAt: 0,
+      bubble: null,
     }
     states.push(state)
     connectNode(state, secret)
   }
 
-  // Enter alt-screen so we don't trash the user's scrollback.
   process.stdout.write(ALT_SCREEN_ON)
   process.stdout.write(HIDE_CURSOR)
   process.stdout.write(`${ESC}2J`)
@@ -496,8 +673,7 @@ export async function runViewer(argv: string[]): Promise<void> {
   process.on('SIGTERM', () => { restore(); process.exit(0) })
   process.on('exit', restore)
 
-  setInterval(render, FRAME_INTERVAL_MS).unref?.()
+  setInterval(renderOpenspace, FRAME_INTERVAL_MS).unref?.()
 
-  // Keep the event loop alive forever (until SIGINT).
   await new Promise<void>(() => {})
 }
